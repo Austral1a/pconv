@@ -32,35 +32,36 @@ cargo build --release --no-default-features
 ## Usage
 
 ```sh
-pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT>
+pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [--workers <N>]
 ```
 
-All three flags are required.
+`--upload-from`, `--offload-to`, and `--output-ext` are required.
 
 | Flag | Short | Meaning |
 | --- | --- | --- |
 | `--upload-from` | `-uf` | Source file, directory, or glob |
 | `--offload-to` | `-ot` | Output directory, or a path pattern with one `*` |
 | `--output-ext` | `-oe` | Target extension, with or without a leading dot |
+| `--workers` | `-w` | Images to convert at the same time (default `1`) |
 
 Short flags work with or without `=`:
 
 ```sh
-pconv -uf photos -ot out -oe webp
-pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg
+pconv -uf photos -ot out -oe webp -w 4
+pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4
 ```
 
-Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
+Each worker converts one image at a time. While images are converting, a progress line on the terminal shows the current file and how many have started. Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
 
 ## Paths
 
 `--upload-from` accepts a relative or absolute path:
 
-- A file is converted as-is.
-- A directory is scanned recursively.
-- A glob may use `*`, `?`, and `**`.
+- A file is converted as-is. A file whose extension is not a supported image format is an error.
+- A directory is scanned recursively. Non-image files are skipped.
+- A glob may use `*`, `?`, and `**`. Matches that are not supported image formats are skipped.
 
-`--offload-to` is a relative or absolute output directory, or a pattern with at most one `*`. That `*` is replaced by each source filename stem (the name without its extension). `--output-ext` sets the written extension and replaces any extension written in the offload pattern.
+`--offload-to` is a relative or absolute output directory, or a pattern with at most one `*`. A directory keeps each file's path relative to the upload root, so `public/images/products/gallery/01.jpg` becomes `public/out/products/gallery/01.avif`. A `*` is replaced by the filename stem only, which flattens every match into one directory. `--output-ext` sets the written extension and replaces any extension written in the offload pattern.
 
 ```sh
 pconv --upload-from './photos' --offload-to './out' --output-ext webp
@@ -68,9 +69,9 @@ pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext jpg
 pconv -uf='photos/**/*.png' -ot='converted_*' -oe=jpg
 ```
 
-The first command writes `./out/<stem>.webp` for every image under `./photos`. The third writes `converted_<stem>.jpg` in the current directory.
+The first command writes `./out/a/cat.webp` for `./photos/a/cat.png`. The third writes `converted_<stem>.jpg` in the current directory.
 
-Output directories are created when they do not exist. If two sources would write the same path (for example `a/cat.png` and `b/cat.jpg` both mapping to `out/cat.webp`), nothing is written and the command reports the collision.
+Output directories are created when they do not exist. A `*` pattern that would write two sources to the same path (for example `a/cat.png` and `b/cat.jpg` both mapping to `out/cat.webp`) writes nothing and reports the collision.
 
 ## Formats
 

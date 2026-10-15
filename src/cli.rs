@@ -3,13 +3,16 @@ use clap::Parser;
 const AFTER_HELP: &str = "\
 Pattern rules:
   --upload-from is a relative or absolute path: a file, a directory (scanned recursively), or a glob (`*`, `?`, `**`).
-  --offload-to is a relative or absolute output directory, or a pattern with one `*` for the source filename stem.
+  Files whose extension is not a supported image format are skipped. A single non-image file is an error.
+  --offload-to is a relative or absolute output directory, or a pattern with one `*`.
+  A directory keeps each file's path relative to the upload root. A `*` is replaced by the filename stem only.
   --output-ext is the target format (with or without a leading dot).
+  --workers is how many images to convert at the same time (default 1).
 
 Examples:
   pconv --upload-from './photos' --offload-to './out' --output-ext webp
-  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext jpg
-  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg
+  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext jpg --workers 4
+  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4
 
 Writable extensions:
   png, jpg, jpeg, gif, webp, bmp, tif, tiff, tga, ico, pnm, pbm, pgm, ppm, qoi,
@@ -33,13 +36,33 @@ pub struct Cli {
     #[arg(long = "upload-from", value_name = "PATH")]
     pub upload_from: String,
 
-    /// Output directory or path pattern. Relative and absolute paths are accepted. A `*` is replaced by each source filename stem.
+    /// Output directory or path pattern. A directory keeps the source layout. A `*` is replaced by each source filename stem.
     #[arg(long = "offload-to", value_name = "PATH")]
     pub offload_to: String,
 
     /// Target file extension for converted images (for example `webp` or `.jpg`).
     #[arg(long = "output-ext", value_name = "EXT")]
     pub output_ext: String,
+
+    /// How many images to convert at the same time.
+    #[arg(
+        long = "workers",
+        short = 'w',
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = parse_workers
+    )]
+    pub workers: usize,
+}
+
+fn parse_workers(raw: &str) -> Result<usize, String> {
+    let workers: usize = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number"))?;
+    if workers == 0 {
+        return Err("must be at least 1".to_string());
+    }
+    Ok(workers)
 }
 
 /// Rewrite `-uf` / `-ot` / `-oe` into clap long flags.
@@ -82,7 +105,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_argv;
+    use super::{normalize_argv, Cli};
+    use clap::Parser;
 
     #[test]
     fn rewrites_short_flags_with_equals() {
@@ -140,5 +164,47 @@ mod tests {
     fn stops_rewriting_after_double_dash() {
         let args = normalize_argv(["pconv", "--", "-uf=still-a-path"]);
         assert_eq!(args, ["pconv", "--", "-uf=still-a-path"]);
+    }
+
+    #[test]
+    fn parses_worker_count() {
+        let cli = Cli::try_parse_from([
+            "pconv",
+            "--upload-from",
+            "in",
+            "--offload-to",
+            "out",
+            "--output-ext",
+            "webp",
+            "-w",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(cli.workers, 4);
+
+        let default = Cli::try_parse_from([
+            "pconv",
+            "--upload-from",
+            "in",
+            "--offload-to",
+            "out",
+            "--output-ext",
+            "webp",
+        ])
+        .unwrap();
+        assert_eq!(default.workers, 1);
+
+        let rejected = Cli::try_parse_from([
+            "pconv",
+            "--upload-from",
+            "in",
+            "--offload-to",
+            "out",
+            "--output-ext",
+            "webp",
+            "--workers",
+            "0",
+        ]);
+        assert!(rejected.is_err());
     }
 }

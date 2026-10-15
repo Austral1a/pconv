@@ -10,6 +10,12 @@ pub const INPUT_ONLY_EXTENSIONS: &[&str] = &[
     "srw", "raw",
 ];
 
+/// True when `ext` is a format this tool can decode, with or without a leading dot.
+pub fn is_readable_extension(ext: &str) -> bool {
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    !ext.is_empty() && TargetFormat::from_ext(&ext).is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetFormat {
     Image(ImageFormat),

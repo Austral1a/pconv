@@ -13,7 +13,12 @@ fn main() -> ExitCode {
     let args = cli::normalize_argv(std::env::args());
     let cli = Cli::parse_from(args);
 
-    match convert::run(&cli.upload_from, &cli.offload_to, &cli.output_ext) {
+    match convert::run(
+        &cli.upload_from,
+        &cli.offload_to,
+        &cli.output_ext,
+        cli.workers,
+    ) {
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(1)

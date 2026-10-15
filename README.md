@@ -6,6 +6,7 @@
 
 - [Rust](https://www.rust-lang.org/tools/install) (edition 2021)
 - For HEIC and HEIF: `libheif` and `pkg-config` on the machine that builds the binary. HEIC support is on by default.
+- For WebP encode/decode via libwebp: `libwebp` (and `pkg-config`) at build time.
 
 ## Install
 
@@ -21,13 +22,27 @@ Build a release binary without installing it:
 cargo build --release
 ```
 
-The binary is `target/release/pconv`.
+For the fastest AVIF encodes on the machine you build on:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+On x86_64, rav1e assembly needs `nasm`. Apple Silicon uses NEON without it. The binary is `target/release/pconv`.
 
 To build without HEIC and HEIF (no `libheif` required):
 
 ```sh
 cargo build --release --no-default-features
 ```
+
+Recommended AVIF batch (good quality, cores workers, resume):
+
+```sh
+pconv -uf public/images -ot public/out/ -oe avif -w "$(sysctl -n hw.ncpu 2>/dev/null || nproc)" --skip-existing
+```
+
+For maximum speed at the cost of visible quality loss, add `-s 10`. For sharper results, try `-s 2 -q 90`.
 
 ## Usage
 
@@ -42,20 +57,20 @@ pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [options]
 | `--upload-from` | `-uf` | Source file, directory, or glob |
 | `--offload-to` | `-ot` | Output directory, or a path pattern with one `*` |
 | `--output-ext` | `-oe` | Target extension, with or without a leading dot |
-| `--workers` | `-w` | Images to convert at the same time (default: CPU cores) |
-| `--speed` | `-s` | AVIF speed, `1` slowest to `10` fastest (default `10`) |
-| `--quality` | `-q` | Lossy quality for JPEG, AVIF, HEIC/HEIF, `1`–`100` (default `80`) |
+| `--workers` | `-w` | Concurrent conversion workers (default: CPU cores; not capped to that) |
+| `--speed` | `-s` | AVIF encode effort, `1` slowest to `10` fastest (default `4`; visual quality is mainly `-q`) |
+| `--quality` | `-q` | Lossy quality for JPEG, WebP, AVIF, HEIC/HEIF, `1`–`100` (default `80`; WebP `100` = lossless) |
 | `--memory` | `-m` | Max RAM budget, e.g. `512M` or `2G` (optional) |
 | `--skip-existing` |  | Leave existing output files untouched |
 
 Short flags work with or without `=`:
 
 ```sh
-pconv -uf photos -ot out -oe avif -s 10 -q 70 -m 2G
+pconv -uf photos -ot out -oe avif -q 90 -m 2G
 pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 --skip-existing
 ```
 
-Each worker converts one image at a time. The worker count is limited to the number of CPU cores: AVIF encoding already uses the cores, so extra workers make the run slower. `--memory` caps decode allocations and can lower workers so concurrent converts stay under the budget (about 64M per worker at minimum). AVIF is much slower than JPEG or WebP; `--speed 10` is the fastest setting, and `--skip-existing` lets you resume a long batch. `--speed` is AVIF-only. `--quality` applies to JPEG, AVIF, and HEIC/HEIF; WebP here is lossless, so quality does not change it.
+`--workers` is a concurrent worker pool: each worker pulls the next image and converts it. The default is the CPU core count, but you can set higher values (`-w 32`, `-w 256`). Workers are only reduced by `--memory` (about 64M per worker at minimum) or by the number of files left to convert. For AVIF, values far above the core count often do not help and can contend for CPU; JPEG/WebP usually scale better. `--speed` is AVIF-only encode effort: `10` is much blurrier/blockier than `4`; `1` is very slow and mainly shrinks file size. Raise `--quality` (e.g. `-q 90`) if the image looks soft or blocky. AVIF is encoded at 10-bit via ravif (same as cavif). `--quality` applies to JPEG, WebP, AVIF, and HEIC/HEIF. WebP uses libwebp lossy encoding by default (`-q 80`); `-q 100` is lossless. `--skip-existing` lets you resume a long batch.
 
 While images are converting, a progress line on the terminal shows the current file and how many have started. Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
 

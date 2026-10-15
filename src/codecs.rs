@@ -7,6 +7,7 @@ use image::{
     DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader, Limits, RgbImage,
     RgbaImage,
 };
+use rgb::AsPixels;
 use zune_core::bit_depth::BitDepth;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::EncoderOptions;
@@ -29,19 +30,30 @@ pub fn decode_image(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage,
         Some(TargetFormat::Jpeg2000) => decode_jp2(path, max_alloc),
         Some(TargetFormat::Psd) => decode_psd(path, max_alloc),
         Some(TargetFormat::Raw) => decode_raw(path, max_alloc),
-        _ => {
-            let mut reader = ImageReader::open(path)
-                .map_err(|error| error.to_string())?
-                .with_guessed_format()
-                .map_err(|error| error.to_string())?;
-            if let Some(max_alloc) = max_alloc {
-                let mut limits = Limits::default();
-                limits.max_alloc = Some(max_alloc);
-                reader.limits(limits);
-            }
-            reader.decode().map_err(|error| error.to_string())
-        }
+        Some(TargetFormat::Image(format)) => decode_with_format(path, Some(format), max_alloc),
+        None => decode_with_format(path, ImageFormat::from_extension(&ext), max_alloc),
     }
+}
+
+fn decode_with_format(
+    path: &Path,
+    format: Option<ImageFormat>,
+    max_alloc: Option<u64>,
+) -> Result<DynamicImage, String> {
+    let mut reader = ImageReader::open(path).map_err(|error| error.to_string())?;
+    if let Some(format) = format {
+        reader.set_format(format);
+    } else {
+        reader = reader
+            .with_guessed_format()
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(max_alloc) = max_alloc {
+        let mut limits = Limits::default();
+        limits.max_alloc = Some(max_alloc);
+        reader.limits(limits);
+    }
+    reader.decode().map_err(|error| error.to_string())
 }
 
 fn check_rgba_budget(max_alloc: Option<u64>, width: u32, height: u32) -> Result<(), String> {
@@ -60,6 +72,76 @@ fn check_rgba_budget(max_alloc: Option<u64>, width: u32, height: u32) -> Result<
     Ok(())
 }
 
+enum RgbCow<'a> {
+    Borrowed(&'a RgbImage),
+    Owned(RgbImage),
+}
+
+impl RgbCow<'_> {
+    fn as_raw(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(image) => image.as_raw(),
+            Self::Owned(image) => image.as_raw(),
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            Self::Borrowed(image) => image.width(),
+            Self::Owned(image) => image.width(),
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::Borrowed(image) => image.height(),
+            Self::Owned(image) => image.height(),
+        }
+    }
+}
+
+fn rgb8_pixels(image: &DynamicImage) -> RgbCow<'_> {
+    match image {
+        DynamicImage::ImageRgb8(rgb) => RgbCow::Borrowed(rgb),
+        other => RgbCow::Owned(other.to_rgb8()),
+    }
+}
+
+enum RgbaCow<'a> {
+    Borrowed(&'a RgbaImage),
+    Owned(RgbaImage),
+}
+
+impl RgbaCow<'_> {
+    fn as_raw(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(image) => image.as_raw(),
+            Self::Owned(image) => image.as_raw(),
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            Self::Borrowed(image) => image.width(),
+            Self::Owned(image) => image.width(),
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::Borrowed(image) => image.height(),
+            Self::Owned(image) => image.height(),
+        }
+    }
+}
+
+fn rgba8_pixels(image: &DynamicImage) -> RgbaCow<'_> {
+    match image {
+        DynamicImage::ImageRgba8(rgba) => RgbaCow::Borrowed(rgba),
+        other => RgbaCow::Owned(other.to_rgba8()),
+    }
+}
+
 pub fn encode_image(
     image: &DynamicImage,
     dest: &Path,
@@ -68,17 +150,12 @@ pub fn encode_image(
     quality: u8,
     avif_threads: Option<usize>,
 ) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-    }
-
     match target {
         TargetFormat::Image(ImageFormat::Jpeg) => encode_jpeg(image, dest, quality),
         TargetFormat::Image(ImageFormat::Avif) => {
             encode_avif(image, dest, speed, quality, avif_threads)
         }
+        TargetFormat::Image(ImageFormat::WebP) => encode_webp(image, dest, quality),
         TargetFormat::Image(ImageFormat::Farbfeld) => image
             .to_rgba16()
             .save_with_format(dest, ImageFormat::Farbfeld)
@@ -106,16 +183,17 @@ pub fn encode_image(
 }
 
 fn encode_jpeg(image: &DynamicImage, dest: &Path, quality: u8) -> Result<(), String> {
-    let rgb = image.to_rgb8();
-    let mut file = File::create(dest).map_err(|error| error.to_string())?;
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, quality)
+    let rgb = rgb8_pixels(image);
+    let mut encoded = Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
         .write_image(
             rgb.as_raw(),
             rgb.width(),
             rgb.height(),
             ExtendedColorType::Rgb8,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    fs::write(dest, encoded.into_inner()).map_err(|error| error.to_string())
 }
 
 fn encode_avif(
@@ -125,17 +203,61 @@ fn encode_avif(
     quality: u8,
     threads: Option<usize>,
 ) -> Result<(), String> {
-    let rgb = image.to_rgb8();
-    let mut file = File::create(dest).map_err(|error| error.to_string())?;
-    image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut file, speed, quality)
-        .with_num_threads(threads)
-        .write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            ExtendedColorType::Rgb8,
-        )
-        .map_err(|error| error.to_string())
+    // Use ravif directly: image::AvifEncoder always forces 8-bit depth, which adds
+    // banding/blockiness. ravif's default (Auto/10-bit) matches cavif and looks better.
+    let quality = f32::from(quality);
+    let encoder = ravif::Encoder::new()
+        .with_quality(quality)
+        .with_alpha_quality(quality)
+        .with_speed(speed)
+        .with_bit_depth(ravif::BitDepth::Auto)
+        .with_num_threads(threads);
+
+    let encoded = if image.color().has_alpha() {
+        let rgba = rgba8_pixels(image);
+        encoder
+            .encode_rgba(ravif::Img::new(
+                rgba.as_raw().as_pixels(),
+                rgba.width() as usize,
+                rgba.height() as usize,
+            ))
+            .map_err(|error| error.to_string())?
+    } else {
+        let rgb = rgb8_pixels(image);
+        encoder
+            .encode_rgb(ravif::Img::new(
+                rgb.as_raw().as_pixels(),
+                rgb.width() as usize,
+                rgb.height() as usize,
+            ))
+            .map_err(|error| error.to_string())?
+    };
+
+    fs::write(dest, encoded.avif_file).map_err(|error| error.to_string())
+}
+
+fn encode_webp(image: &DynamicImage, dest: &Path, quality: u8) -> Result<(), String> {
+    // libwebp bindings only accept RGB8 / RGBA8 layouts.
+    let owned;
+    let image = match image {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => image,
+        other if other.color().has_alpha() => {
+            owned = DynamicImage::ImageRgba8(other.to_rgba8());
+            &owned
+        }
+        other => {
+            owned = DynamicImage::ImageRgb8(other.to_rgb8());
+            &owned
+        }
+    };
+    let encoder =
+        webp::Encoder::from_image(image).map_err(|error| format!("webp encode: {error}"))?;
+    let encoded = if quality >= 100 {
+        encoder.encode_lossless()
+    } else {
+        encoder.encode(f32::from(quality))
+    };
+    fs::write(dest, &*encoded).map_err(|error| error.to_string())
 }
 
 fn decode_jxl(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
@@ -147,7 +269,7 @@ fn decode_jxl(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, Strin
 }
 
 fn encode_jxl(image: &DynamicImage, dest: &Path) -> Result<(), String> {
-    let rgba = image.to_rgba8();
+    let rgba = rgba8_pixels(image);
     let options = EncoderOptions::new(
         rgba.width() as usize,
         rgba.height() as usize,
@@ -241,16 +363,23 @@ fn encode_icns(image: &DynamicImage, dest: &Path) -> Result<(), String> {
         .find(|size| *size >= longest)
         .unwrap_or(1024);
     let resized = image.resize_exact(side, side, image::imageops::FilterType::Lanczos3);
-    let rgba = resized.to_rgba8();
-    let icon = icns::Image::from_data(icns::PixelFormat::RGBA, side, side, rgba.into_raw())
-        .map_err(|error| error.to_string())?;
+    let rgba = rgba8_pixels(&resized);
+    let icon = icns::Image::from_data(
+        icns::PixelFormat::RGBA,
+        side,
+        side,
+        rgba.as_raw().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
     let mut family = icns::IconFamily::new();
     family
         .add_icon(&icon)
         .map_err(|error| error.to_string())?;
+    let mut encoded = Cursor::new(Vec::new());
     family
-        .write(File::create(dest).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+        .write(&mut encoded)
+        .map_err(|error| error.to_string())?;
+    fs::write(dest, encoded.into_inner()).map_err(|error| error.to_string())
 }
 
 fn decode_psd(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
@@ -323,7 +452,7 @@ fn encode_heic(image: &DynamicImage, dest: &Path, quality: u8) -> Result<(), Str
         Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, LibHeif, RgbChroma,
     };
 
-    let rgb = image.to_rgb8();
+    let rgb = rgb8_pixels(image);
     let width = rgb.width();
     let height = rgb.height();
     let lib = LibHeif::new();

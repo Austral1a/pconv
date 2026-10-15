@@ -40,6 +40,16 @@ jpeg2k = { version = "0.10", default-features = false, features = [
 jxl-oxide = { version = "0.12", features = ["image"] }
 libheif-rs = { version = "2", optional = true }
 psd = "0.3"
+# Enable assembly in the shared rav1e used by image/ravif (faster AVIF encodes).
+rav1e = { version = "0.8", default-features = false, features = ["asm"] }
+# Encode AVIF via ravif directly (10-bit). image::AvifEncoder forces 8-bit and looks worse.
+ravif = { version = "0.13", default-features = false, features = ["asm", "threading"] }
 resvg = "0.45"
+rgb = { version = "0.8", default-features = false }
+webp = { version = "0.3", default-features = true, features = ["img"] }
 zune-core = "0.5"
 zune-jpegxl = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

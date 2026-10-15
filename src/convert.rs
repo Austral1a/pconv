@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
+use std::time::Instant;
 
 use crate::format::{is_readable_extension, INPUT_ONLY_EXTENSIONS, OUTPUT_EXTENSIONS, TargetFormat};
 
@@ -176,13 +177,7 @@ fn convert_planned(
     }
 
     let cores = cpu_count();
-    let requested = workers;
-    let mut workers = requested.clamp(1, planned.len()).min(cores);
-    if requested > cores && planned.len() > cores {
-        eprintln!(
-            "using {workers} workers ({cores} CPU cores). Extra workers slow encoding because each image already uses the CPU."
-        );
-    }
+    let mut workers = workers.max(1);
     if let Some(limit) = memory {
         let by_memory = (limit / MIN_BYTES_PER_WORKER).max(1) as usize;
         if by_memory < workers {
@@ -192,6 +187,11 @@ fn convert_planned(
             );
             workers = by_memory;
         }
+    }
+    if workers > cores * 2 {
+        eprintln!(
+            "note: {workers} workers on {cores} CPU cores; for AVIF, values near the core count are usually fastest"
+        );
     }
 
     let mut result = RunResult::default();
@@ -211,11 +211,13 @@ fn convert_planned(
     let workers = workers.min(pending.len());
     let max_alloc = memory.map(|limit| (limit / workers as u64).max(1));
     let avif_threads = if workers == 1 { None } else { Some(1) };
-    let slots: Mutex<Vec<Option<Outcome>>> =
-        Mutex::new((0..pending.len()).map(|_| None).collect());
+    // Per-slot locks avoid one global mutex on every completion.
+    let slots: Vec<Mutex<Option<Outcome>>> =
+        (0..pending.len()).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let started = AtomicUsize::new(0);
     let loader = Mutex::new(Loader::new(pending.len()));
+    let last_draw_ms = AtomicU64::new(0);
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -227,7 +229,7 @@ fn convert_planned(
                     }
                     let (source, dest) = &pending[index];
                     let shown = started.fetch_add(1, Ordering::Relaxed) + 1;
-                    loader.lock().unwrap().tick(shown, source);
+                    maybe_tick_loader(&loader, &last_draw_ms, shown, pending.len(), source);
                     let outcome = match convert_one(
                         source,
                         dest,
@@ -240,7 +242,7 @@ fn convert_planned(
                         Ok(()) => Outcome::Done(dest.clone()),
                         Err(error) => Outcome::Failed(source.clone(), error),
                     };
-                    slots.lock().unwrap()[index] = Some(outcome);
+                    *slots[index].lock().unwrap() = Some(outcome);
                 }
             });
         }
@@ -248,14 +250,44 @@ fn convert_planned(
 
     loader.lock().unwrap().clear();
 
-    for outcome in slots.into_inner().unwrap() {
-        match outcome {
+    for slot in slots {
+        match slot.into_inner().unwrap() {
             Some(Outcome::Done(dest)) => result.successes.push(dest),
             Some(Outcome::Failed(source, error)) => result.failures.push((source, error)),
             None => unreachable!("worker left a conversion unfinished"),
         }
     }
     result
+}
+
+fn maybe_tick_loader(
+    loader: &Mutex<Loader>,
+    last_draw_ms: &AtomicU64,
+    shown: usize,
+    total: usize,
+    source: &Path,
+) {
+    use std::sync::OnceLock;
+
+    const MIN_INTERVAL_MS: u64 = 100;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let now_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    if shown == total {
+        last_draw_ms.store(now_ms, Ordering::Relaxed);
+        loader.lock().unwrap().tick(shown, source);
+        return;
+    }
+    let prev = last_draw_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < MIN_INTERVAL_MS {
+        return;
+    }
+    if last_draw_ms
+        .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    loader.lock().unwrap().tick(shown, source);
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -693,6 +725,33 @@ mod tests {
         let result = run(&upload, &offload, "avif", 1, 10, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert!(result.successes[0].exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converts_png_to_lossy_webp() {
+        let dir = std::env::temp_dir().join(format!(
+            "pconv-webp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("red.png");
+        RgbImage::from_pixel(32, 32, Rgb([255, 0, 0]))
+            .save_with_format(&source, image::ImageFormat::Png)
+            .unwrap();
+
+        let upload = format!("{}", source.display());
+        let offload = format!("{}/*", dir.display());
+        let result = run(&upload, &offload, "webp", 1, 4, 80, None, false).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        let bytes = fs::read(&result.successes[0]).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"VP8 "));
+        assert!(!bytes.windows(4).any(|w| w == b"VP8L"));
 
         let _ = fs::remove_dir_all(&dir);
     }

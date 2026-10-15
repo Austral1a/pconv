@@ -7,15 +7,15 @@ Pattern rules:
   --offload-to is a relative or absolute output directory, or a pattern with one `*`.
   A directory keeps each file's path relative to the upload root. A `*` is replaced by the filename stem only.
   --output-ext is the target format (with or without a leading dot).
-  --workers is how many images to convert at the same time. It defaults to the number of CPU cores, and higher values are limited to that count.
-  --speed is the AVIF encoder speed, from 1 (smallest files) to 10 (fastest). Default is 10. Other formats ignore it.
-  --quality is lossy quality from 1 to 100 (default 80). Applies to jpg/jpeg, avif, and heic/heif.
+  --workers is how many images to convert at the same time (a concurrent worker pool). Default is the CPU core count. It is not capped to that count; use --memory if RAM is the limit.
+  --speed is AVIF encode effort, from 1 (slowest, usually smaller files) to 10 (fastest, often blurrier). Default is 4. Visual quality is mainly --quality. Other formats ignore --speed.
+  --quality is lossy quality from 1 to 100 (default 80). Applies to jpg/jpeg, webp, avif, and heic/heif. For webp, 100 is lossless.
   --memory caps decode/encode RAM (for example `512M` or `2G`). Also lowers workers when needed.
   --skip-existing leaves output files that already exist untouched.
 
 Examples:
   pconv --upload-from './photos' --offload-to './out' --output-ext webp
-  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext avif --speed 10
+  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext avif --quality 90
   pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 -m=1G --skip-existing
 
 Writable extensions:
@@ -25,7 +25,8 @@ Writable extensions:
 Read-only extensions:
   dds, psd, jp2, j2k, j2c, jpx, dng, cr2, nef, arw, raf, orf, rw2, pef, srw, raw
 
-HEIC/HEIF requires libheif (and pkg-config) at build time.";
+HEIC/HEIF requires libheif (and pkg-config) at build time.
+WebP encoding requires libwebp (and pkg-config) at build time.";
 
 /// Convert images matched by a glob into another format.
 #[derive(Parser, Debug)]
@@ -48,21 +49,21 @@ pub struct Cli {
     #[arg(long = "output-ext", value_name = "EXT")]
     pub output_ext: String,
 
-    /// How many images to convert at the same time. Defaults to the number of CPU cores.
+    /// Concurrent conversion workers (like a worker pool). Defaults to the number of CPU cores.
     #[arg(long = "workers", short = 'w', value_name = "N", value_parser = parse_workers)]
     pub workers: Option<usize>,
 
-    /// AVIF encoder speed from 1 (smallest files, slowest) to 10 (fastest).
+    /// AVIF encode effort from 1 (slowest) to 10 (fastest). Visual quality is mainly --quality.
     #[arg(
         long = "speed",
         short = 's',
         value_name = "1-10",
-        default_value_t = 10,
+        default_value_t = 4,
         value_parser = parse_speed
     )]
     pub speed: u8,
 
-    /// Lossy quality from 1 (worst) to 100 (best). Applies to JPEG, AVIF, and HEIC/HEIF.
+    /// Lossy quality from 1 (worst) to 100 (best). Applies to JPEG, WebP, AVIF, and HEIC/HEIF. WebP 100 is lossless.
     #[arg(
         long = "quality",
         short = 'q',
@@ -271,7 +272,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.workers, Some(4));
-        assert_eq!(cli.speed, 10);
+        assert_eq!(cli.speed, 4);
         assert_eq!(cli.quality, 80);
         assert_eq!(cli.memory, None);
         assert!(!cli.skip_existing);
@@ -292,7 +293,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(default.workers, None);
-        assert_eq!(default.speed, 10);
+        assert_eq!(default.speed, 4);
         assert_eq!(default.quality, 60);
         assert_eq!(default.memory, Some(512 * 1024 * 1024));
         assert!(default.skip_existing);

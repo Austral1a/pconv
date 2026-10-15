@@ -3,7 +3,10 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use base64::Engine;
-use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, RgbImage, RgbaImage};
+use image::{
+    DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader, Limits, RgbImage,
+    RgbaImage,
+};
 use zune_core::bit_depth::BitDepth;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::EncoderOptions;
@@ -11,7 +14,7 @@ use zune_jpegxl::JxlSimpleEncoder;
 
 use crate::format::TargetFormat;
 
-pub fn decode_image(path: &Path) -> Result<DynamicImage, String> {
+pub fn decode_image(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let ext = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -19,20 +22,42 @@ pub fn decode_image(path: &Path) -> Result<DynamicImage, String> {
         .to_ascii_lowercase();
 
     match TargetFormat::from_ext(&ext) {
-        Some(TargetFormat::Heic) => decode_heic(path),
-        Some(TargetFormat::Jxl) => decode_jxl(path),
-        Some(TargetFormat::Svg) => decode_svg(path),
-        Some(TargetFormat::Icns) => decode_icns(path),
-        Some(TargetFormat::Jpeg2000) => decode_jp2(path),
-        Some(TargetFormat::Psd) => decode_psd(path),
-        Some(TargetFormat::Raw) => decode_raw(path),
-        _ => image::ImageReader::open(path)
-            .map_err(|error| error.to_string())?
-            .with_guessed_format()
-            .map_err(|error| error.to_string())?
-            .decode()
-            .map_err(|error| error.to_string()),
+        Some(TargetFormat::Heic) => decode_heic(path, max_alloc),
+        Some(TargetFormat::Jxl) => decode_jxl(path, max_alloc),
+        Some(TargetFormat::Svg) => decode_svg(path, max_alloc),
+        Some(TargetFormat::Icns) => decode_icns(path, max_alloc),
+        Some(TargetFormat::Jpeg2000) => decode_jp2(path, max_alloc),
+        Some(TargetFormat::Psd) => decode_psd(path, max_alloc),
+        Some(TargetFormat::Raw) => decode_raw(path, max_alloc),
+        _ => {
+            let mut reader = ImageReader::open(path)
+                .map_err(|error| error.to_string())?
+                .with_guessed_format()
+                .map_err(|error| error.to_string())?;
+            if let Some(max_alloc) = max_alloc {
+                let mut limits = Limits::default();
+                limits.max_alloc = Some(max_alloc);
+                reader.limits(limits);
+            }
+            reader.decode().map_err(|error| error.to_string())
+        }
     }
+}
+
+fn check_rgba_budget(max_alloc: Option<u64>, width: u32, height: u32) -> Result<(), String> {
+    let Some(max_alloc) = max_alloc else {
+        return Ok(());
+    };
+    let needed = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "image dimensions overflow memory budget".to_string())?;
+    if needed > max_alloc {
+        return Err(format!(
+            "image needs about {needed} bytes but memory limit for this worker is {max_alloc} bytes"
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_image(
@@ -113,10 +138,12 @@ fn encode_avif(
         .map_err(|error| error.to_string())
 }
 
-fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
+fn decode_jxl(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let decoder = jxl_oxide::integration::JxlDecoder::new(file).map_err(|error| error.to_string())?;
-    DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())
+    let image = DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
+    check_rgba_budget(max_alloc, image.width(), image.height())?;
+    Ok(image)
 }
 
 fn encode_jxl(image: &DynamicImage, dest: &Path) -> Result<(), String> {
@@ -135,7 +162,7 @@ fn encode_jxl(image: &DynamicImage, dest: &Path) -> Result<(), String> {
     fs::write(dest, encoded).map_err(|error| error.to_string())
 }
 
-fn decode_svg(path: &Path) -> Result<DynamicImage, String> {
+fn decode_svg(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let svg = if path
         .extension()
@@ -158,6 +185,7 @@ fn decode_svg(path: &Path) -> Result<DynamicImage, String> {
     let size = tree.size().to_int_size();
     let width = size.width().max(1);
     let height = size.height().max(1);
+    check_rgba_budget(max_alloc, width, height)?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| "failed to allocate SVG pixmap".to_string())?;
     resvg::render(
@@ -184,7 +212,7 @@ fn encode_svg(image: &DynamicImage, dest: &Path) -> Result<(), String> {
     fs::write(dest, svg).map_err(|error| error.to_string())
 }
 
-fn decode_icns(path: &Path) -> Result<DynamicImage, String> {
+fn decode_icns(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let family = icns::IconFamily::read(File::open(path).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     let icon_type = family
@@ -198,6 +226,7 @@ fn decode_icns(path: &Path) -> Result<DynamicImage, String> {
         .get_icon_with_type(icon_type)
         .map_err(|error| error.to_string())?
         .convert_to(icns::PixelFormat::RGBA);
+    check_rgba_budget(max_alloc, icon.width(), icon.height())?;
     RgbaImage::from_raw(icon.width(), icon.height(), icon.data().to_vec())
         .map(DynamicImage::ImageRgba8)
         .ok_or_else(|| "icns decode produced invalid dimensions".to_string())
@@ -224,32 +253,34 @@ fn encode_icns(image: &DynamicImage, dest: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn decode_psd(path: &Path) -> Result<DynamicImage, String> {
+fn decode_psd(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let psd = psd::Psd::from_bytes(&bytes).map_err(|error| format!("{error:?}"))?;
+    check_rgba_budget(max_alloc, psd.width(), psd.height())?;
     RgbaImage::from_raw(psd.width(), psd.height(), psd.rgba())
         .map(DynamicImage::ImageRgba8)
         .ok_or_else(|| "psd decode produced invalid dimensions".to_string())
 }
 
-fn decode_raw(path: &Path) -> Result<DynamicImage, String> {
+fn decode_raw(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let decoded = imagepipe::simple_decode_8bit(path, 16384, 16384)?;
-    RgbImage::from_raw(
-        u32::try_from(decoded.width).map_err(|error| error.to_string())?,
-        u32::try_from(decoded.height).map_err(|error| error.to_string())?,
-        decoded.data,
-    )
-    .map(DynamicImage::ImageRgb8)
-    .ok_or_else(|| "raw decode produced invalid dimensions".to_string())
+    let width = u32::try_from(decoded.width).map_err(|error| error.to_string())?;
+    let height = u32::try_from(decoded.height).map_err(|error| error.to_string())?;
+    check_rgba_budget(max_alloc, width, height)?;
+    RgbImage::from_raw(width, height, decoded.data)
+        .map(DynamicImage::ImageRgb8)
+        .ok_or_else(|| "raw decode produced invalid dimensions".to_string())
 }
 
-fn decode_jp2(path: &Path) -> Result<DynamicImage, String> {
+fn decode_jp2(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     let image = jpeg2k::Image::from_file(path).map_err(|error| error.to_string())?;
-    DynamicImage::try_from(&image).map_err(|error| error.to_string())
+    let decoded = DynamicImage::try_from(&image).map_err(|error| error.to_string())?;
+    check_rgba_budget(max_alloc, decoded.width(), decoded.height())?;
+    Ok(decoded)
 }
 
 #[cfg(feature = "heic")]
-fn decode_heic(path: &Path) -> Result<DynamicImage, String> {
+fn decode_heic(path: &Path, max_alloc: Option<u64>) -> Result<DynamicImage, String> {
     use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
     let path = path
@@ -260,6 +291,7 @@ fn decode_heic(path: &Path) -> Result<DynamicImage, String> {
     let handle = ctx
         .primary_image_handle()
         .map_err(|error| error.to_string())?;
+    check_rgba_budget(max_alloc, handle.width(), handle.height())?;
     let decoded = lib
         .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)
         .map_err(|error| error.to_string())?;
@@ -281,7 +313,7 @@ fn decode_heic(path: &Path) -> Result<DynamicImage, String> {
 }
 
 #[cfg(not(feature = "heic"))]
-fn decode_heic(_: &Path) -> Result<DynamicImage, String> {
+fn decode_heic(_: &Path, _: Option<u64>) -> Result<DynamicImage, String> {
     Err("HEIC/HEIF support requires libheif (build pconv with the `heic` feature)".to_string())
 }
 

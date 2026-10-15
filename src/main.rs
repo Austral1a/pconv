@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         workers,
         cli.speed,
         cli.quality,
+        cli.memory,
         cli.skip_existing,
     ) {
         Err(error) => {

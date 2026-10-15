@@ -10,12 +10,13 @@ Pattern rules:
   --workers is how many images to convert at the same time. It defaults to the number of CPU cores, and higher values are limited to that count.
   --speed is the AVIF encoder speed, from 1 (smallest files) to 10 (fastest). Default is 10. Other formats ignore it.
   --quality is lossy quality from 1 to 100 (default 80). Applies to jpg/jpeg, avif, and heic/heif.
+  --memory caps decode/encode RAM (for example `512M` or `2G`). Also lowers workers when needed.
   --skip-existing leaves output files that already exist untouched.
 
 Examples:
   pconv --upload-from './photos' --offload-to './out' --output-ext webp
   pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext avif --speed 10
-  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 --skip-existing
+  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 -m=1G --skip-existing
 
 Writable extensions:
   png, jpg, jpeg, gif, webp, bmp, tif, tiff, tga, ico, pnm, pbm, pgm, ppm, qoi,
@@ -71,6 +72,10 @@ pub struct Cli {
     )]
     pub quality: u8,
 
+    /// Max RAM for concurrent conversions (for example `512M`, `2G`). Limits decode size and may lower workers.
+    #[arg(long = "memory", short = 'm', value_name = "SIZE", value_parser = parse_memory)]
+    pub memory: Option<u64>,
+
     /// Skip conversions whose output file already exists.
     #[arg(long = "skip-existing")]
     pub skip_existing: bool,
@@ -104,6 +109,50 @@ fn parse_workers(raw: &str) -> Result<usize, String> {
         return Err("must be at least 1".to_string());
     }
     Ok(workers)
+}
+
+fn parse_memory(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(rest) = lower.strip_suffix("kib") {
+        (rest, 1024u64)
+    } else if let Some(rest) = lower.strip_suffix("kb") {
+        (rest, 1000)
+    } else if let Some(rest) = lower.strip_suffix('k') {
+        (rest, 1024)
+    } else if let Some(rest) = lower.strip_suffix("mib") {
+        (rest, 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("mb") {
+        (rest, 1000 * 1000)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest, 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("gib") {
+        (rest, 1024 * 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("gb") {
+        (rest, 1000u64 * 1000 * 1000)
+    } else if let Some(rest) = lower.strip_suffix('g') {
+        (rest, 1024 * 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix('b') {
+        (rest, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let digits = digits.trim();
+    if digits.is_empty() {
+        return Err(format!("`{raw}` is not a valid size"));
+    }
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a valid size"))?;
+    if value == 0 {
+        return Err("must be greater than 0".to_string());
+    }
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`{raw}` is too large"))
 }
 
 /// Rewrite `-uf` / `-ot` / `-oe` into clap long flags.
@@ -224,6 +273,7 @@ mod tests {
         assert_eq!(cli.workers, Some(4));
         assert_eq!(cli.speed, 10);
         assert_eq!(cli.quality, 80);
+        assert_eq!(cli.memory, None);
         assert!(!cli.skip_existing);
 
         let default = Cli::try_parse_from([
@@ -236,12 +286,15 @@ mod tests {
             "webp",
             "--quality",
             "60",
+            "-m",
+            "512M",
             "--skip-existing",
         ])
         .unwrap();
         assert_eq!(default.workers, None);
         assert_eq!(default.speed, 10);
         assert_eq!(default.quality, 60);
+        assert_eq!(default.memory, Some(512 * 1024 * 1024));
         assert!(default.skip_existing);
 
         let rejected = Cli::try_parse_from([
@@ -256,5 +309,16 @@ mod tests {
             "0",
         ]);
         assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn parses_memory_sizes() {
+        use super::parse_memory;
+        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert_eq!(parse_memory("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_memory("0").is_err());
+        assert!(parse_memory("").is_err());
     }
 }

@@ -129,6 +129,9 @@ pub fn cpu_count() -> usize {
         .unwrap_or(1)
 }
 
+/// Soft floor used when `--memory` lowers the worker count.
+const MIN_BYTES_PER_WORKER: u64 = 64 * 1024 * 1024;
+
 pub fn run(
     upload_from: &str,
     offload_to: &str,
@@ -136,6 +139,7 @@ pub fn run(
     workers: usize,
     speed: u8,
     quality: u8,
+    memory: Option<u64>,
     skip_existing: bool,
 ) -> Result<RunResult, ConvertError> {
     let pattern = OffloadPattern::parse(offload_to, output_ext)?;
@@ -148,6 +152,7 @@ pub fn run(
         workers,
         speed,
         quality,
+        memory,
         skip_existing,
     ))
 }
@@ -163,6 +168,7 @@ fn convert_planned(
     workers: usize,
     speed: u8,
     quality: u8,
+    memory: Option<u64>,
     skip_existing: bool,
 ) -> RunResult {
     if planned.is_empty() {
@@ -171,11 +177,21 @@ fn convert_planned(
 
     let cores = cpu_count();
     let requested = workers;
-    let workers = requested.clamp(1, planned.len()).min(cores);
+    let mut workers = requested.clamp(1, planned.len()).min(cores);
     if requested > cores && planned.len() > cores {
         eprintln!(
             "using {workers} workers ({cores} CPU cores). Extra workers slow encoding because each image already uses the CPU."
         );
+    }
+    if let Some(limit) = memory {
+        let by_memory = (limit / MIN_BYTES_PER_WORKER).max(1) as usize;
+        if by_memory < workers {
+            eprintln!(
+                "using {by_memory} workers to stay within memory limit {}",
+                format_bytes(limit)
+            );
+            workers = by_memory;
+        }
     }
 
     let mut result = RunResult::default();
@@ -192,13 +208,14 @@ fn convert_planned(
     }
 
     prepare_output_dirs(&pending);
+    let workers = workers.min(pending.len());
+    let max_alloc = memory.map(|limit| (limit / workers as u64).max(1));
     let avif_threads = if workers == 1 { None } else { Some(1) };
     let slots: Mutex<Vec<Option<Outcome>>> =
         Mutex::new((0..pending.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     let started = AtomicUsize::new(0);
     let loader = Mutex::new(Loader::new(pending.len()));
-    let workers = workers.min(pending.len());
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -211,11 +228,18 @@ fn convert_planned(
                     let (source, dest) = &pending[index];
                     let shown = started.fetch_add(1, Ordering::Relaxed) + 1;
                     loader.lock().unwrap().tick(shown, source);
-                    let outcome =
-                        match convert_one(source, dest, target, speed, quality, avif_threads) {
-                            Ok(()) => Outcome::Done(dest.clone()),
-                            Err(error) => Outcome::Failed(source.clone(), error),
-                        };
+                    let outcome = match convert_one(
+                        source,
+                        dest,
+                        target,
+                        speed,
+                        quality,
+                        max_alloc,
+                        avif_threads,
+                    ) {
+                        Ok(()) => Outcome::Done(dest.clone()),
+                        Err(error) => Outcome::Failed(source.clone(), error),
+                    };
                     slots.lock().unwrap()[index] = Some(outcome);
                 }
             });
@@ -232,6 +256,22 @@ fn convert_planned(
         }
     }
     result
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1}G", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.0}M", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.0}K", bytes_f / KIB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 pub fn collect_sources(pattern: &str) -> Result<Vec<PathBuf>, ConvertError> {
@@ -441,9 +481,10 @@ fn convert_one(
     target: TargetFormat,
     speed: u8,
     quality: u8,
+    max_alloc: Option<u64>,
     avif_threads: Option<usize>,
 ) -> Result<(), String> {
-    let image = crate::codecs::decode_image(source)?;
+    let image = crate::codecs::decode_image(source, max_alloc)?;
     crate::codecs::encode_image(&image, dest, target, speed, quality, avif_threads)
 }
 
@@ -453,6 +494,14 @@ mod tests {
     use image::{Rgb, RgbImage};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn memory_limit_lowers_worker_count() {
+        assert_eq!(format_bytes(512 * 1024 * 1024), "512M");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0G");
+        let by_memory = ((64 * 1024 * 1024) / MIN_BYTES_PER_WORKER).max(1) as usize;
+        assert_eq!(by_memory, 1);
+    }
 
     #[test]
     fn shortens_long_paths_from_the_end() {
@@ -610,7 +659,7 @@ mod tests {
 
         let upload = format!("{}/red.png", dir.display());
         let offload = format!("{}/out/*", dir.display());
-        let result = run(&upload, &offload, "jpg", 1, 8, 80, false).unwrap();
+        let result = run(&upload, &offload, "jpg", 1, 8, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes.len(), 1);
 
@@ -641,7 +690,7 @@ mod tests {
 
         let upload = format!("{}", source.display());
         let offload = format!("{}/*", dir.display());
-        let result = run(&upload, &offload, "avif", 1, 10, 80, false).unwrap();
+        let result = run(&upload, &offload, "avif", 1, 10, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert!(result.successes[0].exists());
 
@@ -668,7 +717,7 @@ mod tests {
         }
 
         let result =
-            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, false).unwrap();
+            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(
             result.successes,
@@ -686,7 +735,7 @@ mod tests {
         let marker = b"already-converted";
         fs::write(out.join("a.jpg"), marker).unwrap();
         let skipped =
-            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, true).unwrap();
+            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, None, true).unwrap();
         assert!(skipped.failures.is_empty(), "{:?}", skipped.failures);
         assert_eq!(fs::read(out.join("a.jpg")).unwrap(), marker);
 
@@ -717,7 +766,7 @@ mod tests {
         let from_dir = collect_sources(dir.to_str().unwrap()).unwrap();
         assert!(from_dir.contains(&source));
 
-        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, false).unwrap();
+        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes, vec![out.join("photos").join("red.jpg")]);
         assert!(out.join("photos").join("red.jpg").is_file());
@@ -749,7 +798,7 @@ mod tests {
         let sources = collect_sources(dir.to_str().unwrap()).unwrap();
         assert_eq!(sources, vec![source]);
 
-        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, false).unwrap();
+        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, None, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes, vec![out.join("red.jpg")]);
 
@@ -779,18 +828,18 @@ mod tests {
         let upload = format!("{}", source.display());
         let offload = format!("{}/*", dir.display());
 
-        let ff = run(&upload, &offload, "ff", 1, 8, 80, false).unwrap();
+        let ff = run(&upload, &offload, "ff", 1, 8, 80, None, false).unwrap();
         assert!(ff.failures.is_empty(), "{:?}", ff.failures);
         assert!(ff.successes[0].exists());
 
-        let svg = run(&upload, &offload, "svg", 1, 8, 80, false).unwrap();
+        let svg = run(&upload, &offload, "svg", 1, 8, 80, None, false).unwrap();
         assert!(svg.failures.is_empty(), "{:?}", svg.failures);
         let svg_text = fs::read_to_string(&svg.successes[0]).unwrap();
         assert!(svg_text.contains("<svg"));
 
-        let jxl = run(&upload, &offload, "jxl", 1, 8, 80, false).unwrap();
+        let jxl = run(&upload, &offload, "jxl", 1, 8, 80, None, false).unwrap();
         assert!(jxl.failures.is_empty(), "{:?}", jxl.failures);
-        let decoded = crate::codecs::decode_image(&jxl.successes[0]).unwrap();
+        let decoded = crate::codecs::decode_image(&jxl.successes[0], None).unwrap();
         assert_eq!(decoded.width(), 2);
 
         let svg_src = dir.join("box.svg");
@@ -800,12 +849,12 @@ mod tests {
         )
         .unwrap();
         let from_svg =
-            run(&format!("{}", svg_src.display()), &offload, "png", 1, 8, 80, false).unwrap();
+            run(&format!("{}", svg_src.display()), &offload, "png", 1, 8, 80, None, false).unwrap();
         assert!(from_svg.failures.is_empty(), "{:?}", from_svg.failures);
 
-        let icns = run(&upload, &offload, "icns", 1, 8, 80, false).unwrap();
+        let icns = run(&upload, &offload, "icns", 1, 8, 80, None, false).unwrap();
         assert!(icns.failures.is_empty(), "{:?}", icns.failures);
-        let decoded_icns = crate::codecs::decode_image(&icns.successes[0]).unwrap();
+        let decoded_icns = crate::codecs::decode_image(&icns.successes[0], None).unwrap();
         assert!(decoded_icns.width() >= 16);
 
         let _ = fs::remove_dir_all(&dir);

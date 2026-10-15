@@ -45,16 +45,17 @@ pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [options]
 | `--workers` | `-w` | Images to convert at the same time (default: CPU cores) |
 | `--speed` | `-s` | AVIF speed, `1` slowest to `10` fastest (default `10`) |
 | `--quality` | `-q` | Lossy quality for JPEG, AVIF, HEIC/HEIF, `1`–`100` (default `80`) |
+| `--memory` | `-m` | Max RAM budget, e.g. `512M` or `2G` (optional) |
 | `--skip-existing` |  | Leave existing output files untouched |
 
 Short flags work with or without `=`:
 
 ```sh
-pconv -uf photos -ot out -oe avif -s 10 -q 70
+pconv -uf photos -ot out -oe avif -s 10 -q 70 -m 2G
 pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 --skip-existing
 ```
 
-Each worker converts one image at a time. The worker count is limited to the number of CPU cores: AVIF encoding already uses the cores, so extra workers make the run slower. AVIF is much slower than JPEG or WebP; `--speed 10` is the fastest setting, and `--skip-existing` lets you resume a long batch. `--speed` is AVIF-only. `--quality` applies to JPEG, AVIF, and HEIC/HEIF; WebP here is lossless, so quality does not change it.
+Each worker converts one image at a time. The worker count is limited to the number of CPU cores: AVIF encoding already uses the cores, so extra workers make the run slower. `--memory` caps decode allocations and can lower workers so concurrent converts stay under the budget (about 64M per worker at minimum). AVIF is much slower than JPEG or WebP; `--speed 10` is the fastest setting, and `--skip-existing` lets you resume a long batch. `--speed` is AVIF-only. `--quality` applies to JPEG, AVIF, and HEIC/HEIF; WebP here is lossless, so quality does not change it.
 
 While images are converting, a progress line on the terminal shows the current file and how many have started. Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
 

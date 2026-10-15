@@ -32,7 +32,7 @@ cargo build --release --no-default-features
 ## Usage
 
 ```sh
-pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [--workers <N>]
+pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [options]
 ```
 
 `--upload-from`, `--offload-to`, and `--output-ext` are required.
@@ -42,16 +42,21 @@ pconv --upload-from <PATH> --offload-to <PATH> --output-ext <EXT> [--workers <N>
 | `--upload-from` | `-uf` | Source file, directory, or glob |
 | `--offload-to` | `-ot` | Output directory, or a path pattern with one `*` |
 | `--output-ext` | `-oe` | Target extension, with or without a leading dot |
-| `--workers` | `-w` | Images to convert at the same time (default `1`) |
+| `--workers` | `-w` | Images to convert at the same time (default: CPU cores) |
+| `--speed` | `-s` | AVIF speed, `1` slowest to `10` fastest (default `10`) |
+| `--quality` | `-q` | Lossy quality for JPEG, AVIF, HEIC/HEIF, `1`–`100` (default `80`) |
+| `--skip-existing` |  | Leave existing output files untouched |
 
 Short flags work with or without `=`:
 
 ```sh
-pconv -uf photos -ot out -oe webp -w 4
-pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4
+pconv -uf photos -ot out -oe avif -s 10 -q 70
+pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 --skip-existing
 ```
 
-Each worker converts one image at a time. While images are converting, a progress line on the terminal shows the current file and how many have started. Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
+Each worker converts one image at a time. The worker count is limited to the number of CPU cores: AVIF encoding already uses the cores, so extra workers make the run slower. AVIF is much slower than JPEG or WebP; `--speed 10` is the fastest setting, and `--skip-existing` lets you resume a long batch. `--speed` is AVIF-only. `--quality` applies to JPEG, AVIF, and HEIC/HEIF; WebP here is lossless, so quality does not change it.
+
+While images are converting, a progress line on the terminal shows the current file and how many have started. Successful output paths are printed to stdout, one per line. Per-file errors go to stderr. The process exits with status `1` if nothing matched, the arguments are invalid, or any file failed to convert.
 
 ## Paths
 

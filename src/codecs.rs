@@ -3,7 +3,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use base64::Engine;
-use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
+use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, RgbImage, RgbaImage};
 use zune_core::bit_depth::BitDepth;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::EncoderOptions;
@@ -39,6 +39,9 @@ pub fn encode_image(
     image: &DynamicImage,
     dest: &Path,
     target: TargetFormat,
+    speed: u8,
+    quality: u8,
+    avif_threads: Option<usize>,
 ) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
@@ -47,14 +50,10 @@ pub fn encode_image(
     }
 
     match target {
-        TargetFormat::Image(ImageFormat::Jpeg) => image
-            .to_rgb8()
-            .save_with_format(dest, ImageFormat::Jpeg)
-            .map_err(|error| error.to_string()),
-        TargetFormat::Image(ImageFormat::Avif) => image
-            .to_rgb8()
-            .save_with_format(dest, ImageFormat::Avif)
-            .map_err(|error| error.to_string()),
+        TargetFormat::Image(ImageFormat::Jpeg) => encode_jpeg(image, dest, quality),
+        TargetFormat::Image(ImageFormat::Avif) => {
+            encode_avif(image, dest, speed, quality, avif_threads)
+        }
         TargetFormat::Image(ImageFormat::Farbfeld) => image
             .to_rgba16()
             .save_with_format(dest, ImageFormat::Farbfeld)
@@ -70,7 +69,7 @@ pub fn encode_image(
         TargetFormat::Image(format) => image
             .save_with_format(dest, format)
             .map_err(|error| error.to_string()),
-        TargetFormat::Heic => encode_heic(image, dest),
+        TargetFormat::Heic => encode_heic(image, dest, quality),
         TargetFormat::Jxl => encode_jxl(image, dest),
         TargetFormat::Svg => encode_svg(image, dest),
         TargetFormat::Icns => encode_icns(image, dest),
@@ -79,6 +78,39 @@ pub fn encode_image(
             target.name()
         )),
     }
+}
+
+fn encode_jpeg(image: &DynamicImage, dest: &Path, quality: u8) -> Result<(), String> {
+    let rgb = image.to_rgb8();
+    let mut file = File::create(dest).map_err(|error| error.to_string())?;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, quality)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn encode_avif(
+    image: &DynamicImage,
+    dest: &Path,
+    speed: u8,
+    quality: u8,
+    threads: Option<usize>,
+) -> Result<(), String> {
+    let rgb = image.to_rgb8();
+    let mut file = File::create(dest).map_err(|error| error.to_string())?;
+    image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut file, speed, quality)
+        .with_num_threads(threads)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
@@ -254,7 +286,7 @@ fn decode_heic(_: &Path) -> Result<DynamicImage, String> {
 }
 
 #[cfg(feature = "heic")]
-fn encode_heic(image: &DynamicImage, dest: &Path) -> Result<(), String> {
+fn encode_heic(image: &DynamicImage, dest: &Path, quality: u8) -> Result<(), String> {
     use libheif_rs::{
         Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, LibHeif, RgbChroma,
     };
@@ -305,7 +337,7 @@ fn encode_heic(image: &DynamicImage, dest: &Path) -> Result<(), String> {
         .or_else(|_| lib.encoder_for_format(CompressionFormat::Av1))
         .map_err(|error| error.to_string())?;
     encoder
-        .set_quality(EncoderQuality::Lossy(80))
+        .set_quality(EncoderQuality::Lossy(quality))
         .map_err(|error| error.to_string())?;
     context
         .encode_image(&heif, &mut encoder, None)
@@ -319,6 +351,6 @@ fn encode_heic(image: &DynamicImage, dest: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(feature = "heic"))]
-fn encode_heic(_: &DynamicImage, _: &Path) -> Result<(), String> {
+fn encode_heic(_: &DynamicImage, _: &Path, _: u8) -> Result<(), String> {
     Err("HEIC/HEIF support requires libheif (build pconv with the `heic` feature)".to_string())
 }

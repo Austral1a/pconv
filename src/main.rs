@@ -13,11 +13,15 @@ fn main() -> ExitCode {
     let args = cli::normalize_argv(std::env::args());
     let cli = Cli::parse_from(args);
 
+    let workers = cli.workers.unwrap_or_else(convert::cpu_count);
     match convert::run(
         &cli.upload_from,
         &cli.offload_to,
         &cli.output_ext,
-        cli.workers,
+        workers,
+        cli.speed,
+        cli.quality,
+        cli.skip_existing,
     ) {
         Err(error) => {
             eprintln!("{error}");

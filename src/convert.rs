@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -123,17 +123,33 @@ pub struct RunResult {
     pub failures: Vec<(PathBuf, String)>,
 }
 
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
 pub fn run(
     upload_from: &str,
     offload_to: &str,
     output_ext: &str,
     workers: usize,
+    speed: u8,
+    quality: u8,
+    skip_existing: bool,
 ) -> Result<RunResult, ConvertError> {
     let pattern = OffloadPattern::parse(offload_to, output_ext)?;
     let root = upload_root(upload_from);
     let sources = collect_sources(upload_from)?;
     let planned = plan_outputs(&sources, &pattern, &root)?;
-    Ok(convert_planned(&planned, pattern.target(), workers))
+    Ok(convert_planned(
+        &planned,
+        pattern.target(),
+        workers,
+        speed,
+        quality,
+        skip_existing,
+    ))
 }
 
 enum Outcome {
@@ -145,33 +161,61 @@ fn convert_planned(
     planned: &[(PathBuf, PathBuf)],
     target: TargetFormat,
     workers: usize,
+    speed: u8,
+    quality: u8,
+    skip_existing: bool,
 ) -> RunResult {
     if planned.is_empty() {
         return RunResult::default();
     }
 
-    let workers = workers.clamp(1, planned.len());
+    let cores = cpu_count();
+    let requested = workers;
+    let workers = requested.clamp(1, planned.len()).min(cores);
+    if requested > cores && planned.len() > cores {
+        eprintln!(
+            "using {workers} workers ({cores} CPU cores). Extra workers slow encoding because each image already uses the CPU."
+        );
+    }
+
+    let mut result = RunResult::default();
+    let mut pending = Vec::with_capacity(planned.len());
+    for (source, dest) in planned {
+        if skip_existing && dest.is_file() {
+            result.successes.push(dest.clone());
+            continue;
+        }
+        pending.push((source.clone(), dest.clone()));
+    }
+    if pending.is_empty() {
+        return result;
+    }
+
+    prepare_output_dirs(&pending);
+    let avif_threads = if workers == 1 { None } else { Some(1) };
     let slots: Mutex<Vec<Option<Outcome>>> =
-        Mutex::new((0..planned.len()).map(|_| None).collect());
+        Mutex::new((0..pending.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     let started = AtomicUsize::new(0);
-    let loader = Mutex::new(Loader::new(planned.len()));
+    let loader = Mutex::new(Loader::new(pending.len()));
+    let workers = workers.min(pending.len());
 
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= planned.len() {
+                    if index >= pending.len() {
                         break;
                     }
-                    let (source, dest) = &planned[index];
+                    let (source, dest) = &pending[index];
                     let shown = started.fetch_add(1, Ordering::Relaxed) + 1;
                     loader.lock().unwrap().tick(shown, source);
-                    let outcome = match convert_one(source, dest, target) {
-                        Ok(()) => Outcome::Done(dest.clone()),
-                        Err(error) => Outcome::Failed(source.clone(), error),
-                    };
+                    let outcome =
+                        match convert_one(source, dest, target, speed, quality, avif_threads) {
+                            Ok(()) => Outcome::Done(dest.clone()),
+                            Err(error) => Outcome::Failed(source.clone(), error),
+                        };
                     slots.lock().unwrap()[index] = Some(outcome);
                 }
             });
@@ -180,7 +224,6 @@ fn convert_planned(
 
     loader.lock().unwrap().clear();
 
-    let mut result = RunResult::default();
     for outcome in slots.into_inner().unwrap() {
         match outcome {
             Some(Outcome::Done(dest)) => result.successes.push(dest),
@@ -378,9 +421,30 @@ fn shorten_path(path: &Path, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-fn convert_one(source: &Path, dest: &Path, target: TargetFormat) -> Result<(), String> {
+fn prepare_output_dirs(planned: &[(PathBuf, PathBuf)]) {
+    let mut dirs = BTreeSet::new();
+    for (_, dest) in planned {
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                dirs.insert(parent);
+            }
+        }
+    }
+    for dir in dirs {
+        let _ = std::fs::create_dir_all(dir);
+    }
+}
+
+fn convert_one(
+    source: &Path,
+    dest: &Path,
+    target: TargetFormat,
+    speed: u8,
+    quality: u8,
+    avif_threads: Option<usize>,
+) -> Result<(), String> {
     let image = crate::codecs::decode_image(source)?;
-    crate::codecs::encode_image(&image, dest, target)
+    crate::codecs::encode_image(&image, dest, target, speed, quality, avif_threads)
 }
 
 #[cfg(test)]
@@ -546,7 +610,7 @@ mod tests {
 
         let upload = format!("{}/red.png", dir.display());
         let offload = format!("{}/out/*", dir.display());
-        let result = run(&upload, &offload, "jpg", 1).unwrap();
+        let result = run(&upload, &offload, "jpg", 1, 8, 80, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes.len(), 1);
 
@@ -555,6 +619,31 @@ mod tests {
         let decoded = image::open(dest).unwrap();
         assert_eq!(decoded.width(), 1);
         assert_eq!(decoded.height(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn converts_png_to_avif() {
+        let dir = std::env::temp_dir().join(format!(
+            "pconv-avif-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("red.png");
+        RgbImage::from_pixel(2, 2, Rgb([255, 0, 0]))
+            .save_with_format(&source, image::ImageFormat::Png)
+            .unwrap();
+
+        let upload = format!("{}", source.display());
+        let offload = format!("{}/*", dir.display());
+        let result = run(&upload, &offload, "avif", 1, 10, 80, false).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(result.successes[0].exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -569,15 +658,17 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in");
+        let out = dir.join("out");
+        fs::create_dir_all(&input).unwrap();
         for name in ["a", "b", "c", "d"] {
             RgbImage::from_pixel(1, 1, Rgb([255, 0, 0]))
-                .save_with_format(dir.join(format!("{name}.png")), image::ImageFormat::Png)
+                .save_with_format(input.join(format!("{name}.png")), image::ImageFormat::Png)
                 .unwrap();
         }
 
-        let out = dir.join("out");
-        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4).unwrap();
+        let result =
+            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(
             result.successes,
@@ -591,6 +682,13 @@ mod tests {
         for dest in &result.successes {
             assert!(dest.is_file());
         }
+
+        let marker = b"already-converted";
+        fs::write(out.join("a.jpg"), marker).unwrap();
+        let skipped =
+            run(input.to_str().unwrap(), out.to_str().unwrap(), "jpg", 4, 8, 80, true).unwrap();
+        assert!(skipped.failures.is_empty(), "{:?}", skipped.failures);
+        assert_eq!(fs::read(out.join("a.jpg")).unwrap(), marker);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -619,7 +717,7 @@ mod tests {
         let from_dir = collect_sources(dir.to_str().unwrap()).unwrap();
         assert!(from_dir.contains(&source));
 
-        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1).unwrap();
+        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes, vec![out.join("photos").join("red.jpg")]);
         assert!(out.join("photos").join("red.jpg").is_file());
@@ -651,7 +749,7 @@ mod tests {
         let sources = collect_sources(dir.to_str().unwrap()).unwrap();
         assert_eq!(sources, vec![source]);
 
-        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1).unwrap();
+        let result = run(dir.to_str().unwrap(), out.to_str().unwrap(), "jpg", 1, 8, 80, false).unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.successes, vec![out.join("red.jpg")]);
 
@@ -681,16 +779,16 @@ mod tests {
         let upload = format!("{}", source.display());
         let offload = format!("{}/*", dir.display());
 
-        let ff = run(&upload, &offload, "ff", 1).unwrap();
+        let ff = run(&upload, &offload, "ff", 1, 8, 80, false).unwrap();
         assert!(ff.failures.is_empty(), "{:?}", ff.failures);
         assert!(ff.successes[0].exists());
 
-        let svg = run(&upload, &offload, "svg", 1).unwrap();
+        let svg = run(&upload, &offload, "svg", 1, 8, 80, false).unwrap();
         assert!(svg.failures.is_empty(), "{:?}", svg.failures);
         let svg_text = fs::read_to_string(&svg.successes[0]).unwrap();
         assert!(svg_text.contains("<svg"));
 
-        let jxl = run(&upload, &offload, "jxl", 1).unwrap();
+        let jxl = run(&upload, &offload, "jxl", 1, 8, 80, false).unwrap();
         assert!(jxl.failures.is_empty(), "{:?}", jxl.failures);
         let decoded = crate::codecs::decode_image(&jxl.successes[0]).unwrap();
         assert_eq!(decoded.width(), 2);
@@ -701,10 +799,11 @@ mod tests {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#00ff00"/></svg>"##,
         )
         .unwrap();
-        let from_svg = run(&format!("{}", svg_src.display()), &offload, "png", 1).unwrap();
+        let from_svg =
+            run(&format!("{}", svg_src.display()), &offload, "png", 1, 8, 80, false).unwrap();
         assert!(from_svg.failures.is_empty(), "{:?}", from_svg.failures);
 
-        let icns = run(&upload, &offload, "icns", 1).unwrap();
+        let icns = run(&upload, &offload, "icns", 1, 8, 80, false).unwrap();
         assert!(icns.failures.is_empty(), "{:?}", icns.failures);
         let decoded_icns = crate::codecs::decode_image(&icns.successes[0]).unwrap();
         assert!(decoded_icns.width() >= 16);

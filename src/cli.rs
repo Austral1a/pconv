@@ -7,12 +7,15 @@ Pattern rules:
   --offload-to is a relative or absolute output directory, or a pattern with one `*`.
   A directory keeps each file's path relative to the upload root. A `*` is replaced by the filename stem only.
   --output-ext is the target format (with or without a leading dot).
-  --workers is how many images to convert at the same time (default 1).
+  --workers is how many images to convert at the same time. It defaults to the number of CPU cores, and higher values are limited to that count.
+  --speed is the AVIF encoder speed, from 1 (smallest files) to 10 (fastest). Default is 10. Other formats ignore it.
+  --quality is lossy quality from 1 to 100 (default 80). Applies to jpg/jpeg, avif, and heic/heif.
+  --skip-existing leaves output files that already exist untouched.
 
 Examples:
   pconv --upload-from './photos' --offload-to './out' --output-ext webp
-  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext jpg --workers 4
-  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4
+  pconv --upload-from '/tmp/in/*.png' --offload-to '/tmp/out' --output-ext avif --speed 10
+  pconv -uf='photos/**/*.png' -ot='out/*' -oe=jpg -w=4 --skip-existing
 
 Writable extensions:
   png, jpg, jpeg, gif, webp, bmp, tif, tiff, tga, ico, pnm, pbm, pgm, ppm, qoi,
@@ -44,15 +47,53 @@ pub struct Cli {
     #[arg(long = "output-ext", value_name = "EXT")]
     pub output_ext: String,
 
-    /// How many images to convert at the same time.
+    /// How many images to convert at the same time. Defaults to the number of CPU cores.
+    #[arg(long = "workers", short = 'w', value_name = "N", value_parser = parse_workers)]
+    pub workers: Option<usize>,
+
+    /// AVIF encoder speed from 1 (smallest files, slowest) to 10 (fastest).
     #[arg(
-        long = "workers",
-        short = 'w',
-        value_name = "N",
-        default_value_t = 1,
-        value_parser = parse_workers
+        long = "speed",
+        short = 's',
+        value_name = "1-10",
+        default_value_t = 10,
+        value_parser = parse_speed
     )]
-    pub workers: usize,
+    pub speed: u8,
+
+    /// Lossy quality from 1 (worst) to 100 (best). Applies to JPEG, AVIF, and HEIC/HEIF.
+    #[arg(
+        long = "quality",
+        short = 'q',
+        value_name = "1-100",
+        default_value_t = 80,
+        value_parser = parse_quality
+    )]
+    pub quality: u8,
+
+    /// Skip conversions whose output file already exists.
+    #[arg(long = "skip-existing")]
+    pub skip_existing: bool,
+}
+
+fn parse_speed(raw: &str) -> Result<u8, String> {
+    let speed: u8 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number"))?;
+    if !(1..=10).contains(&speed) {
+        return Err("must be from 1 to 10".to_string());
+    }
+    Ok(speed)
+}
+
+fn parse_quality(raw: &str) -> Result<u8, String> {
+    let quality: u8 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number"))?;
+    if !(1..=100).contains(&quality) {
+        return Err("must be from 1 to 100".to_string());
+    }
+    Ok(quality)
 }
 
 fn parse_workers(raw: &str) -> Result<usize, String> {
@@ -180,7 +221,10 @@ mod tests {
             "4",
         ])
         .unwrap();
-        assert_eq!(cli.workers, 4);
+        assert_eq!(cli.workers, Some(4));
+        assert_eq!(cli.speed, 10);
+        assert_eq!(cli.quality, 80);
+        assert!(!cli.skip_existing);
 
         let default = Cli::try_parse_from([
             "pconv",
@@ -190,9 +234,15 @@ mod tests {
             "out",
             "--output-ext",
             "webp",
+            "--quality",
+            "60",
+            "--skip-existing",
         ])
         .unwrap();
-        assert_eq!(default.workers, 1);
+        assert_eq!(default.workers, None);
+        assert_eq!(default.speed, 10);
+        assert_eq!(default.quality, 60);
+        assert!(default.skip_existing);
 
         let rejected = Cli::try_parse_from([
             "pconv",
